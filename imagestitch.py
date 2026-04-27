@@ -44,21 +44,22 @@ SEAM_OVERLAP_PX = 0
 STRIP_EMA_ALPHA = 0.0
 
 # feature matching params
-ORB_NFEATURES = 1200
+ORB_NFEATURES = 1800
 ORB_SCALE_FACTOR = 1.2
 ORB_NLEVELS = 8
-MATCH_RATIO_TEST = 0.75
-MIN_GOOD_MATCHES = 10
-MAX_MATCH_STEP_X = 220
-MAX_MATCH_STEP_Y = 220
+MATCH_RATIO_TEST = 0.72
+MIN_GOOD_MATCHES = 20
+MAX_MATCH_STEP_X = 140
+MAX_MATCH_STEP_Y = 140
 MIN_FEATURE_STEP = 2
-FEATURE_BAND_FRAC = 0.50     # bottom band used for matching
+FEATURE_BAND_FRAC = 0.35     # lower band is typically more stable on conveyor/profile scans
 FEATURE_IGNORE_TOP_PX = 0
-MAD_OUTLIER_THR = 25.0       # reject poor matches via median abs deviation
-FALLBACK_TO_FIXED_IF_NO_MATCH = True
+MAD_OUTLIER_THR = 12.0       # tighter outlier rejection
+FALLBACK_TO_FIXED_IF_NO_MATCH = False
 
 # Optional smoothing of matched step
-STEP_EMA_ALPHA = 0.45
+STEP_EMA_ALPHA = 0.70
+STEP_SCALE = 0.80            # reduce extracted strip width to minimize overlap/ghosting
 
 # =========================
 # OUTPUT
@@ -78,8 +79,8 @@ MIN_SAVE_H = 220
 # =========================
 MOTION_DS_W = 320
 MOTION_BLUR = 5
-MOTION_DIFF_THR = 10
-MOTION_AREA_FRAC = 0.008
+MOTION_DIFF_THR = 14
+MOTION_AREA_FRAC = 0.012
 
 # start immediately
 MOTION_START_SEC = 0.0
@@ -87,7 +88,7 @@ MOTION_START_SEC = 0.0
 # stop after 2 sec no motion
 NO_MOTION_STOP_SEC = 2.0
 
-MOTION_USE_BOTTOM_FRAC = 0.20
+MOTION_USE_BOTTOM_FRAC = 0.30
 IGNORE_TOP_PX = 0
 
 # =========================
@@ -824,7 +825,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
             a = float(clamp(STEP_EMA_ALPHA, 0.0, 0.95))
             state["step_ema"] = a * state["step_ema"] + (1.0 - a) * step_abs
 
-        signed_for_extract = np.sign(signed_shift) * max(float(MIN_FEATURE_STEP), float(state["step_ema"])) * 0.95
+        signed_for_extract = np.sign(signed_shift) * max(float(MIN_FEATURE_STEP), float(state["step_ema"])) * float(STEP_SCALE)
         strip, used_step = extract_feature_matched_strip(roi_bgr, state["axis"], signed_for_extract, slit_x, slit_y)
 
         state["last_match_dx"] = float(match["dx"])
