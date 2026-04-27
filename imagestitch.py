@@ -55,12 +55,12 @@ MIN_FEATURE_STEP = 2
 FEATURE_BAND_FRAC = 0.35     # lower band is typically more stable on conveyor/profile scans
 FEATURE_IGNORE_TOP_PX = 0
 MAD_OUTLIER_THR = 12.0       # tighter outlier rejection
-FALLBACK_TO_FIXED_IF_NO_MATCH = False
+FALLBACK_TO_FIXED_IF_NO_MATCH = True
 
 # Optional smoothing of matched step
 STEP_EMA_ALPHA = 0.70
 STEP_SCALE = 0.80            # reduce extracted strip width to minimize overlap/ghosting
-MIN_EFFECTIVE_STEP = 4       # skip tiny shifts that create repeated ghost stripes
+MIN_EFFECTIVE_STEP = 2       # keep small but non-zero strips so every captured frame can be stitched
 MAX_EFFECTIVE_STEP = 90      # cap strip growth to avoid occasional bad jumps
 
 # =========================
@@ -99,7 +99,7 @@ AUTO_POSTROLL_FRAMES = 8     # keep a few frames after motion disappears
 # FRAME BUFFER / STREAM ROBUSTNESS
 # =========================
 FRAMEBUFFER_MAX = 0
-CAP_BUFFERSIZE = 16
+CAP_BUFFERSIZE = 64
 
 READ_FAIL_RETRY_SEC = 0.20
 REOPEN_STREAM_ON_FAIL = True
@@ -697,6 +697,8 @@ state = {
     "step_ema": None,
     "pre_roll": deque(maxlen=AUTO_PREROLL_FRAMES),
     "postroll_left": 0,
+    "captured_frames": 0,
+    "stitched_frames": 0,
 }
 
 
@@ -716,6 +718,8 @@ def reset_panorama():
     state["step_ema"] = None
     state["pre_roll"].clear()
     state["postroll_left"] = 0
+    state["captured_frames"] = 0
+    state["stitched_frames"] = 0
 
 
 def postprocess_panorama_for_save(pano):
@@ -804,6 +808,7 @@ def append_seed_strip_from_frame(roi_bgr, slit_x, slit_y):
 
     state["pano"] = paste_strip_axis(state["pano"], strip, state["axis"], state["dir"], 0)
     state["frames_used"] += 1
+    state["stitched_frames"] += 1
 
 
 def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
@@ -843,7 +848,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
         state["last_match_step"] = int(used_step)
         state["last_match_ok"] = strip is not None and used_step >= max(MIN_FEATURE_STEP, MIN_EFFECTIVE_STEP)
 
-        if strip is not None and strip.size > 0 and used_step >= MIN_EFFECTIVE_STEP:
+        if strip is not None and strip.size > 0:
             if state["axis"] == "x":
                 state["last_strip_w"] = strip.shape[1]
             else:
@@ -851,6 +856,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
 
             state["pano"] = paste_strip_axis(state["pano"], strip, state["axis"], state["dir"], 0)
             state["frames_used"] += 1
+            state["stitched_frames"] += 1
 
         state["prev_capture_roi"] = roi_bgr.copy()
         return used_step
@@ -971,6 +977,7 @@ def main():
         slit_y = clamp(slit_y, 1, h - 2)
 
         if state["capturing"] and USE_EVERY_FRAME_STITCH:
+            state["captured_frames"] += 1
             append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y)
         else:
             state["prev_capture_roi"] = None
@@ -1012,7 +1019,7 @@ def main():
 
             cv2.putText(
                 disp,
-                f"{compute_txt} {mode_txt} axis={state['axis']} {dir_txt} strip={cur_strip}px pano={pano_w}x{pano_h} frames_used={state['frames_used']} q={qlen}",
+                f"{compute_txt} {mode_txt} axis={state['axis']} {dir_txt} strip={cur_strip}px pano={pano_w}x{pano_h} stitched={state['stitched_frames']}/{state['captured_frames']} q={qlen}",
                 (10, 90),
                 FONT,
                 0.60,
