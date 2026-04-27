@@ -58,10 +58,12 @@ MAD_OUTLIER_THR = 12.0       # tighter outlier rejection
 FALLBACK_TO_FIXED_IF_NO_MATCH = True
 
 # Optional smoothing of matched step
-STEP_EMA_ALPHA = 0.70
-STEP_SCALE = 0.80            # reduce extracted strip width to minimize overlap/ghosting
+STEP_EMA_ALPHA = 0.15
+STEP_SCALE = 1.00            # 1.0 keeps real-world length; <1.0 compresses/shrinks profile
 MIN_EFFECTIVE_STEP = 2       # keep small but non-zero strips so every captured frame can be stitched
 MAX_EFFECTIVE_STEP = 90      # cap strip growth to avoid occasional bad jumps
+USE_PHASE_CORR = True        # robust fallback on repetitive container textures
+MIN_PHASE_RESPONSE = 0.10
 
 # =========================
 # OUTPUT
@@ -528,6 +530,37 @@ def estimate_translation_orb(prev_bgr, cur_bgr, axis="x"):
     }
 
 
+def estimate_translation_phase(prev_bgr, cur_bgr, axis="x"):
+    prev_gray = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
+    cur_gray = cv2.cvtColor(cur_bgr, cv2.COLOR_BGR2GRAY)
+
+    mask = make_feature_band_mask(prev_gray, FEATURE_BAND_FRAC, FEATURE_IGNORE_TOP_PX)
+    p = prev_gray.astype(np.float32)
+    c = cur_gray.astype(np.float32)
+    p[mask == 0] = 0.0
+    c[mask == 0] = 0.0
+
+    shift, response = cv2.phaseCorrelate(p, c)
+    dx, dy = float(shift[0]), float(shift[1])
+    response = float(response)
+    if response < MIN_PHASE_RESPONSE:
+        return None
+
+    if axis == "x" and abs(dx) > MAX_MATCH_STEP_X:
+        return None
+    if axis == "y" and abs(dy) > MAX_MATCH_STEP_Y:
+        return None
+
+    return {
+        "dx": dx,
+        "dy": dy,
+        "matches": 0,
+        "dx_inliers": 0,
+        "dy_inliers": 0,
+        "phase_response": response,
+    }
+
+
 def extract_feature_matched_strip(roi_bgr, axis, signed_shift, slit_x, slit_y):
     h, w = roi_bgr.shape[:2]
 
@@ -694,6 +727,7 @@ state = {
     "last_match_step": 0,
     "last_match_count": 0,
     "last_match_ok": False,
+    "last_match_src": "none",
     "step_ema": None,
     "pre_roll": deque(maxlen=AUTO_PREROLL_FRAMES),
     "postroll_left": 0,
@@ -715,6 +749,7 @@ def reset_panorama():
     state["last_match_step"] = 0
     state["last_match_count"] = 0
     state["last_match_ok"] = False
+    state["last_match_src"] = "none"
     state["step_ema"] = None
     state["pre_roll"].clear()
     state["postroll_left"] = 0
@@ -824,9 +859,21 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
         state["last_match_ok"] = False
         return 0
 
+    orb_match = None
+    phase_match = None
     match = None
     if USE_FEATURE_MATCHING:
-        match = estimate_translation_orb(prev_roi, roi_bgr, axis=state["axis"])
+        orb_match = estimate_translation_orb(prev_roi, roi_bgr, axis=state["axis"])
+    if USE_PHASE_CORR:
+        phase_match = estimate_translation_phase(prev_roi, roi_bgr, axis=state["axis"])
+
+    if orb_match is not None and phase_match is not None:
+        orb_shift = orb_match["dx"] if state["axis"] == "x" else orb_match["dy"]
+        phase_shift = phase_match["dx"] if state["axis"] == "x" else phase_match["dy"]
+        # On repetitive ribbed containers ORB can underestimate motion; prefer phase when disagreeing strongly.
+        match = phase_match if abs(orb_shift - phase_shift) > 8.0 else orb_match
+    else:
+        match = orb_match if orb_match is not None else phase_match
 
     if match is not None:
         signed_shift = match["dx"] if state["axis"] == "x" else match["dy"]
@@ -847,6 +894,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
         state["last_match_count"] = int(match["matches"])
         state["last_match_step"] = int(used_step)
         state["last_match_ok"] = strip is not None and used_step >= max(MIN_FEATURE_STEP, MIN_EFFECTIVE_STEP)
+        state["last_match_src"] = "phase" if "phase_response" in match else "orb"
 
         if strip is not None and strip.size > 0:
             if state["axis"] == "x":
@@ -866,6 +914,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
     state["last_match_dx"] = 0.0
     state["last_match_dy"] = 0.0
     state["last_match_step"] = 0
+    state["last_match_src"] = "none"
 
     if FALLBACK_TO_FIXED_IF_NO_MATCH:
         append_seed_strip_from_frame(roi_bgr, slit_x, slit_y)
@@ -1056,7 +1105,7 @@ def main():
 
                 cv2.putText(
                     disp,
-                    f"match_ok={state['last_match_ok']} matches={state['last_match_count']} dx={state['last_match_dx']:.1f} dy={state['last_match_dy']:.1f} step={state['last_match_step']}",
+                    f"match={state['last_match_src']} ok={state['last_match_ok']} matches={state['last_match_count']} dx={state['last_match_dx']:.1f} dy={state['last_match_dy']:.1f} step={state['last_match_step']}",
                     (10, 170),
                     FONT,
                     0.54,
