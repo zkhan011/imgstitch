@@ -60,6 +60,8 @@ FALLBACK_TO_FIXED_IF_NO_MATCH = False
 # Optional smoothing of matched step
 STEP_EMA_ALPHA = 0.70
 STEP_SCALE = 0.80            # reduce extracted strip width to minimize overlap/ghosting
+MIN_EFFECTIVE_STEP = 4       # skip tiny shifts that create repeated ghost stripes
+MAX_EFFECTIVE_STEP = 90      # cap strip growth to avoid occasional bad jumps
 
 # =========================
 # OUTPUT
@@ -88,8 +90,10 @@ MOTION_START_SEC = 0.0
 # stop after 2 sec no motion
 NO_MOTION_STOP_SEC = 2.0
 
-MOTION_USE_BOTTOM_FRAC = 0.30
+MOTION_USE_BOTTOM_FRAC = 0.45
 IGNORE_TOP_PX = 0
+AUTO_PREROLL_FRAMES = 8      # include a few frames before motion trigger
+AUTO_POSTROLL_FRAMES = 8     # keep a few frames after motion disappears
 
 # =========================
 # FRAME BUFFER / STREAM ROBUSTNESS
@@ -691,6 +695,8 @@ state = {
     "last_match_count": 0,
     "last_match_ok": False,
     "step_ema": None,
+    "pre_roll": deque(maxlen=AUTO_PREROLL_FRAMES),
+    "postroll_left": 0,
 }
 
 
@@ -708,6 +714,8 @@ def reset_panorama():
     state["last_match_count"] = 0
     state["last_match_ok"] = False
     state["step_ema"] = None
+    state["pre_roll"].clear()
+    state["postroll_left"] = 0
 
 
 def postprocess_panorama_for_save(pano):
@@ -809,7 +817,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
         state["last_match_dx"] = 0.0
         state["last_match_dy"] = 0.0
         state["last_match_ok"] = False
-        return
+        return 0
 
     match = None
     if USE_FEATURE_MATCHING:
@@ -827,14 +835,15 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
 
         signed_for_extract = np.sign(signed_shift) * max(float(MIN_FEATURE_STEP), float(state["step_ema"])) * float(STEP_SCALE)
         strip, used_step = extract_feature_matched_strip(roi_bgr, state["axis"], signed_for_extract, slit_x, slit_y)
+        used_step = int(clamp(used_step, 0, MAX_EFFECTIVE_STEP))
 
         state["last_match_dx"] = float(match["dx"])
         state["last_match_dy"] = float(match["dy"])
         state["last_match_count"] = int(match["matches"])
         state["last_match_step"] = int(used_step)
-        state["last_match_ok"] = strip is not None and used_step >= MIN_FEATURE_STEP
+        state["last_match_ok"] = strip is not None and used_step >= max(MIN_FEATURE_STEP, MIN_EFFECTIVE_STEP)
 
-        if strip is not None and strip.size > 0:
+        if strip is not None and strip.size > 0 and used_step >= MIN_EFFECTIVE_STEP:
             if state["axis"] == "x":
                 state["last_strip_w"] = strip.shape[1]
             else:
@@ -844,7 +853,7 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
             state["frames_used"] += 1
 
         state["prev_capture_roi"] = roi_bgr.copy()
-        return
+        return used_step
 
     state["last_match_ok"] = False
     state["last_match_count"] = 0
@@ -856,6 +865,20 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
         append_seed_strip_from_frame(roi_bgr, slit_x, slit_y)
 
     state["prev_capture_roi"] = roi_bgr.copy()
+    return 0
+
+
+def start_capture_with_preroll(slit_x, slit_y):
+    state["capturing"] = True
+    state["prev_capture_roi"] = None
+    state["step_ema"] = None
+    pre = list(state["pre_roll"])
+    for frm in pre:
+        h, w = frm.shape[:2]
+        sx = clamp(int(slit_x), 1, w - 2)
+        sy = clamp(int(slit_y), 1, h - 2)
+        append_feature_matched_strip_from_frame(frm, sx, sy)
+    state["pre_roll"].clear()
 
 
 def main():
@@ -896,6 +919,8 @@ def main():
         if w < 10 or h < 10:
             continue
 
+        state["pre_roll"].append(roi_bgr.copy())
+
         mgray = motion_preprocess(roi_bgr, ds_w=MOTION_DS_W, blur_k=MOTION_BLUR, use_gpu=gpu_ok)
 
         frac, meanv, _ = motion_metrics_near_only(
@@ -919,20 +944,26 @@ def main():
         if state["auto"]:
             if not state["capturing"]:
                 if is_motion:
-                    state["capturing"] = True
-                    state["prev_capture_roi"] = None
-                    state["step_ema"] = None
+                    start_capture_with_preroll((w // 2) if SLIT_X < 0 else int(SLIT_X), (h // 2) if SLIT_Y < 0 else int(SLIT_Y))
+                    state["postroll_left"] = 0
                     print("▶ AUTO START")
             else:
                 last_m = state["last_motion_t"]
                 if last_m is not None and (now - last_m) >= NO_MOTION_STOP_SEC:
-                    state["capturing"] = False
-                    print("⏹ AUTO STOP -> SAVE + RESET")
-                    save_panorama(tag="auto")
-                    reset_panorama()
-                    state["motion_on_t"] = None
-                    state["last_motion_t"] = None
-                    continue
+                    if state["postroll_left"] <= 0:
+                        state["postroll_left"] = int(AUTO_POSTROLL_FRAMES)
+                    else:
+                        state["postroll_left"] -= 1
+                        if state["postroll_left"] <= 0:
+                            state["capturing"] = False
+                            print("⏹ AUTO STOP -> SAVE + RESET")
+                            save_panorama(tag="auto")
+                            reset_panorama()
+                            state["motion_on_t"] = None
+                            state["last_motion_t"] = None
+                            continue
+                else:
+                    state["postroll_left"] = 0
 
         slit_x = (w // 2) if SLIT_X < 0 else int(SLIT_X)
         slit_y = (h // 2) if SLIT_Y < 0 else int(SLIT_Y)
