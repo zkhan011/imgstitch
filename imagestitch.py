@@ -32,7 +32,8 @@ DIR = +1         # +1 append right, -1 append left
 # =========================
 # STITCHING / OVERLAP CONTROL
 # =========================
-USE_FEATURE_MATCHING = True
+USE_FEATURE_MATCHING = False
+USE_FIXED_STRIP_ONLY = True   # matches your working approach: constant strip every captured frame
 USE_EVERY_FRAME_STITCH = True
 
 # seed strip used only for the first captured frame
@@ -64,9 +65,14 @@ MIN_EFFECTIVE_STEP = 2       # keep small but non-zero strips so every captured 
 MAX_EFFECTIVE_STEP = 90      # cap strip growth to avoid occasional bad jumps
 USE_PHASE_CORR = True        # robust fallback on repetitive container textures
 MIN_PHASE_RESPONSE = 0.10
-USE_STITCH_BAND = True       # ignore roof/background; stitch only truck/profile band
+USE_STITCH_BAND = False      # disabled by default to match your baseline full-ROI stitching
 STITCH_TOP_FRAC = 0.22
 STITCH_BOTTOM_FRAC = 0.95
+
+# Baseline fixed-strip mode (from your working version)
+STRIP_W = 95
+STRIP_H = 95
+SEAM_OVERLAP_PX = 6
 
 # =========================
 # OUTPUT
@@ -935,6 +941,29 @@ def append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y):
     return 0
 
 
+def append_fixed_strip_from_frame(roi_bgr, slit_x, slit_y):
+    if state["axis"] == "x":
+        strip_w = clamp(int(STRIP_W), 1, max(1, roi_bgr.shape[1] // 2))
+        xs = clamp(slit_x - strip_w // 2, 0, roi_bgr.shape[1] - 1)
+        xe = clamp(xs + strip_w, xs + 1, roi_bgr.shape[1])
+        strip = roi_bgr[:, xs:xe].copy()
+        state["last_strip_w"] = strip.shape[1]
+    else:
+        strip_h = clamp(int(STRIP_H), 1, max(1, roi_bgr.shape[0] // 2))
+        ys = clamp(slit_y - strip_h // 2, 0, roi_bgr.shape[0] - 1)
+        ye = clamp(ys + strip_h, ys + 1, roi_bgr.shape[0])
+        strip = roi_bgr[ys:ye, :].copy()
+        state["last_strip_h"] = strip.shape[0]
+
+    if strip.size <= 0:
+        return 0
+
+    state["pano"] = paste_strip_axis(state["pano"], strip, state["axis"], state["dir"], SEAM_OVERLAP_PX)
+    state["frames_used"] += 1
+    state["stitched_frames"] += 1
+    return int(strip.shape[1] if state["axis"] == "x" else strip.shape[0])
+
+
 def start_capture_with_preroll(slit_x, slit_y):
     state["capturing"] = True
     state["prev_capture_roi"] = None
@@ -944,7 +973,10 @@ def start_capture_with_preroll(slit_x, slit_y):
         h, w = frm.shape[:2]
         sx = clamp(int(slit_x), 1, w - 2)
         sy = clamp(int(slit_y), 1, h - 2)
-        append_feature_matched_strip_from_frame(frm, sx, sy)
+        if USE_FIXED_STRIP_ONLY:
+            append_fixed_strip_from_frame(frm, sx, sy)
+        else:
+            append_feature_matched_strip_from_frame(frm, sx, sy)
     state["pre_roll"].clear()
 
 
@@ -1043,7 +1075,10 @@ def main():
 
         if state["capturing"] and USE_EVERY_FRAME_STITCH:
             state["captured_frames"] += 1
-            append_feature_matched_strip_from_frame(stitch_bgr, slit_x, slit_y)
+            if USE_FIXED_STRIP_ONLY:
+                append_fixed_strip_from_frame(stitch_bgr, slit_x, slit_y)
+            else:
+                append_feature_matched_strip_from_frame(stitch_bgr, slit_x, slit_y)
         else:
             state["prev_capture_roi"] = None
             state["step_ema"] = None
@@ -1121,7 +1156,7 @@ def main():
 
                 cv2.putText(
                     disp,
-                    f"match={state['last_match_src']} ok={state['last_match_ok']} matches={state['last_match_count']} dx={state['last_match_dx']:.1f} dy={state['last_match_dy']:.1f} step={state['last_match_step']}",
+                    f"stitch={'fixed' if USE_FIXED_STRIP_ONLY else state['last_match_src']} ok={state['last_match_ok']} matches={state['last_match_count']} dx={state['last_match_dx']:.1f} dy={state['last_match_dy']:.1f} step={state['last_match_step']}",
                     (10, 170),
                     FONT,
                     0.54,
