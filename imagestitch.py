@@ -35,6 +35,7 @@ DIR = +1         # +1 append right, -1 append left
 USE_FEATURE_MATCHING = False
 USE_FIXED_STRIP_ONLY = True   # matches your working approach: constant strip every captured frame
 USE_EVERY_FRAME_STITCH = True
+USE_SMART_NON_OVERLAP = True  # accumulate motion and append only new, non-overlapping content
 
 # seed strip used only for the first captured frame
 FIXED_STRIP_W = 100
@@ -73,6 +74,7 @@ STITCH_BOTTOM_FRAC = 0.95
 STRIP_W = 95
 STRIP_H = 95
 SEAM_OVERLAP_PX = 6
+MIN_APPEND_STEP = 3
 
 # =========================
 # OUTPUT
@@ -751,6 +753,7 @@ state = {
     "postroll_left": 0,
     "captured_frames": 0,
     "stitched_frames": 0,
+    "residual_shift": 0.0,
 }
 
 
@@ -773,6 +776,7 @@ def reset_panorama():
     state["postroll_left"] = 0
     state["captured_frames"] = 0
     state["stitched_frames"] = 0
+    state["residual_shift"] = 0.0
 
 
 def postprocess_panorama_for_save(pano):
@@ -964,6 +968,40 @@ def append_fixed_strip_from_frame(roi_bgr, slit_x, slit_y):
     return int(strip.shape[1] if state["axis"] == "x" else strip.shape[0])
 
 
+def append_smart_non_overlap_strip_from_frame(roi_bgr, slit_x, slit_y):
+    prev_roi = state["prev_capture_roi"]
+    if prev_roi is None:
+        append_fixed_strip_from_frame(roi_bgr, slit_x, slit_y)
+        state["prev_capture_roi"] = roi_bgr.copy()
+        state["residual_shift"] = 0.0
+        return 0
+
+    # Phase correlation is stable on repetitive container ribs for translational motion.
+    match = estimate_translation_phase(prev_roi, roi_bgr, axis=state["axis"])
+    if match is None:
+        append_fixed_strip_from_frame(roi_bgr, slit_x, slit_y)
+        state["prev_capture_roi"] = roi_bgr.copy()
+        return 0
+
+    signed_shift = float(match["dx"] if state["axis"] == "x" else match["dy"])
+    state["residual_shift"] += signed_shift
+    step = int(abs(state["residual_shift"]))
+    if step < int(MIN_APPEND_STEP):
+        state["prev_capture_roi"] = roi_bgr.copy()
+        return 0
+
+    signed_for_extract = float(np.sign(state["residual_shift"])) * float(step)
+    strip, used_step = extract_feature_matched_strip(roi_bgr, state["axis"], signed_for_extract, slit_x, slit_y)
+    if strip is not None and strip.size > 0:
+        state["pano"] = paste_strip_axis(state["pano"], strip, state["axis"], state["dir"], 0)
+        state["frames_used"] += 1
+        state["stitched_frames"] += 1
+        state["residual_shift"] -= float(np.sign(state["residual_shift"])) * float(used_step)
+
+    state["prev_capture_roi"] = roi_bgr.copy()
+    return int(used_step if strip is not None else 0)
+
+
 def start_capture_with_preroll(slit_x, slit_y):
     state["capturing"] = True
     state["prev_capture_roi"] = None
@@ -973,7 +1011,9 @@ def start_capture_with_preroll(slit_x, slit_y):
         h, w = frm.shape[:2]
         sx = clamp(int(slit_x), 1, w - 2)
         sy = clamp(int(slit_y), 1, h - 2)
-        if USE_FIXED_STRIP_ONLY:
+        if USE_SMART_NON_OVERLAP:
+            append_smart_non_overlap_strip_from_frame(frm, sx, sy)
+        elif USE_FIXED_STRIP_ONLY:
             append_fixed_strip_from_frame(frm, sx, sy)
         else:
             append_feature_matched_strip_from_frame(frm, sx, sy)
@@ -1075,13 +1115,16 @@ def main():
 
         if state["capturing"] and USE_EVERY_FRAME_STITCH:
             state["captured_frames"] += 1
-            if USE_FIXED_STRIP_ONLY:
+            if USE_SMART_NON_OVERLAP:
+                append_smart_non_overlap_strip_from_frame(stitch_bgr, slit_x, slit_y)
+            elif USE_FIXED_STRIP_ONLY:
                 append_fixed_strip_from_frame(stitch_bgr, slit_x, slit_y)
             else:
                 append_feature_matched_strip_from_frame(stitch_bgr, slit_x, slit_y)
         else:
             state["prev_capture_roi"] = None
             state["step_ema"] = None
+            state["residual_shift"] = 0.0
 
         if now - last_ui >= ui_period:
             last_ui = now
@@ -1156,7 +1199,7 @@ def main():
 
                 cv2.putText(
                     disp,
-                    f"stitch={'fixed' if USE_FIXED_STRIP_ONLY else state['last_match_src']} ok={state['last_match_ok']} matches={state['last_match_count']} dx={state['last_match_dx']:.1f} dy={state['last_match_dy']:.1f} step={state['last_match_step']}",
+                    f"stitch={'smart_non_overlap' if USE_SMART_NON_OVERLAP else ('fixed' if USE_FIXED_STRIP_ONLY else state['last_match_src'])} ok={state['last_match_ok']} matches={state['last_match_count']} dx={state['last_match_dx']:.1f} dy={state['last_match_dy']:.1f} step={state['last_match_step']} resid={state['residual_shift']:.2f}",
                     (10, 170),
                     FONT,
                     0.54,
