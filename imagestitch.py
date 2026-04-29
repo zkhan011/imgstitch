@@ -64,6 +64,9 @@ MIN_EFFECTIVE_STEP = 2       # keep small but non-zero strips so every captured 
 MAX_EFFECTIVE_STEP = 90      # cap strip growth to avoid occasional bad jumps
 USE_PHASE_CORR = True        # robust fallback on repetitive container textures
 MIN_PHASE_RESPONSE = 0.10
+USE_STITCH_BAND = True       # ignore roof/background; stitch only truck/profile band
+STITCH_TOP_FRAC = 0.22
+STITCH_BOTTOM_FRAC = 0.95
 
 # =========================
 # OUTPUT
@@ -175,6 +178,15 @@ def crop_roi(frame, roi):
     y1 = clamp(int(y1), 0, frame.shape[0] - 1)
     y2 = clamp(int(y2), y1 + 1, frame.shape[0])
     return frame[y1:y2, x1:x2].copy()
+
+
+def crop_stitch_band(frame):
+    if frame is None or frame.size == 0 or not USE_STITCH_BAND:
+        return frame
+    h, w = frame.shape[:2]
+    y1 = int(clamp(round(h * float(STITCH_TOP_FRAC)), 0, h - 2))
+    y2 = int(clamp(round(h * float(STITCH_BOTTOM_FRAC)), y1 + 1, h))
+    return frame[y1:y2, :].copy()
 
 
 def resize_keep(frame, scale=1.0):
@@ -974,7 +986,10 @@ def main():
         if w < 10 or h < 10:
             continue
 
-        state["pre_roll"].append(roi_bgr.copy())
+        stitch_bgr = crop_stitch_band(roi_bgr)
+        if stitch_bgr is None or stitch_bgr.size == 0:
+            continue
+        state["pre_roll"].append(stitch_bgr.copy())
 
         mgray = motion_preprocess(roi_bgr, ds_w=MOTION_DS_W, blur_k=MOTION_BLUR, use_gpu=gpu_ok)
 
@@ -1020,14 +1035,15 @@ def main():
                 else:
                     state["postroll_left"] = 0
 
-        slit_x = (w // 2) if SLIT_X < 0 else int(SLIT_X)
-        slit_y = (h // 2) if SLIT_Y < 0 else int(SLIT_Y)
-        slit_x = clamp(slit_x, 1, w - 2)
-        slit_y = clamp(slit_y, 1, h - 2)
+        sh, sw = stitch_bgr.shape[:2]
+        slit_x = (sw // 2) if SLIT_X < 0 else int(SLIT_X)
+        slit_y = (sh // 2) if SLIT_Y < 0 else int(SLIT_Y)
+        slit_x = clamp(slit_x, 1, sw - 2)
+        slit_y = clamp(slit_y, 1, sh - 2)
 
         if state["capturing"] and USE_EVERY_FRAME_STITCH:
             state["captured_frames"] += 1
-            append_feature_matched_strip_from_frame(roi_bgr, slit_x, slit_y)
+            append_feature_matched_strip_from_frame(stitch_bgr, slit_x, slit_y)
         else:
             state["prev_capture_roi"] = None
             state["step_ema"] = None
