@@ -36,7 +36,7 @@ USE_FEATURE_MATCHING = False
 USE_FIXED_STRIP_ONLY = True   # matches your working approach: constant strip every captured frame
 USE_EVERY_FRAME_STITCH = True
 USE_SMART_NON_OVERLAP = True  # accumulate motion and append only new, non-overlapping content
-AUTO_DIRECTION_FROM_DX = True
+AUTO_DIRECTION_FROM_DX = False  # keep UI-selected direction stable unless explicitly enabled
 
 # seed strip used only for the first captured frame
 FIXED_STRIP_W = 100
@@ -1005,7 +1005,9 @@ def append_smart_non_overlap_strip_from_frame(roi_bgr, slit_x, slit_y):
     state["smoothed_dx"] = 0.75 * float(state["smoothed_dx"]) + 0.25 * signed_shift
     signed_shift = float(state["smoothed_dx"])
     if AUTO_DIRECTION_FROM_DX and abs(signed_shift) >= 1.0:
-        state["dir"] = 1 if signed_shift >= 0 else -1
+        # In screen coordinates, positive dx means object moved right,
+        # so newly revealed content arrives from left side.
+        state["dir"] = -1 if signed_shift >= 0 else 1
 
     state["residual_shift"] += signed_shift
     step = int(abs(state["residual_shift"]))
