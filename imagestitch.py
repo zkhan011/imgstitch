@@ -36,6 +36,7 @@ USE_FEATURE_MATCHING = False
 USE_FIXED_STRIP_ONLY = True   # matches your working approach: constant strip every captured frame
 USE_EVERY_FRAME_STITCH = True
 USE_SMART_NON_OVERLAP = True  # accumulate motion and append only new, non-overlapping content
+AUTO_DIRECTION_FROM_DX = True
 
 # seed strip used only for the first captured frame
 FIXED_STRIP_W = 100
@@ -75,6 +76,9 @@ STRIP_W = 95
 STRIP_H = 95
 SEAM_OVERLAP_PX = 6
 MIN_APPEND_STEP = 3
+MAX_APPEND_STEP = 120
+MIN_CAPTURE_SEC_BEFORE_STOP_CHECK = 6.0
+DEBUG_LOG_EVERY_N_FRAMES = 8
 
 # =========================
 # OUTPUT
@@ -754,6 +758,11 @@ state = {
     "captured_frames": 0,
     "stitched_frames": 0,
     "residual_shift": 0.0,
+    "capture_started_t": None,
+    "strips_added": 0,
+    "smoothed_dx": 0.0,
+    "frame_idx": 0,
+    "stop_reason": "",
 }
 
 
@@ -777,6 +786,11 @@ def reset_panorama():
     state["captured_frames"] = 0
     state["stitched_frames"] = 0
     state["residual_shift"] = 0.0
+    state["capture_started_t"] = None
+    state["strips_added"] = 0
+    state["smoothed_dx"] = 0.0
+    state["frame_idx"] = 0
+    state["stop_reason"] = ""
 
 
 def postprocess_panorama_for_save(pano):
@@ -965,6 +979,7 @@ def append_fixed_strip_from_frame(roi_bgr, slit_x, slit_y):
     state["pano"] = paste_strip_axis(state["pano"], strip, state["axis"], state["dir"], SEAM_OVERLAP_PX)
     state["frames_used"] += 1
     state["stitched_frames"] += 1
+    state["strips_added"] += 1
     return int(strip.shape[1] if state["axis"] == "x" else strip.shape[0])
 
 
@@ -984,18 +999,32 @@ def append_smart_non_overlap_strip_from_frame(roi_bgr, slit_x, slit_y):
         return 0
 
     signed_shift = float(match["dx"] if state["axis"] == "x" else match["dy"])
+    state["last_match_dx"] = float(match["dx"])
+    state["last_match_dy"] = float(match["dy"])
+    # Smooth dx to reduce jitter and preserve proportions.
+    state["smoothed_dx"] = 0.75 * float(state["smoothed_dx"]) + 0.25 * signed_shift
+    signed_shift = float(state["smoothed_dx"])
+    if AUTO_DIRECTION_FROM_DX and abs(signed_shift) >= 1.0:
+        state["dir"] = 1 if signed_shift >= 0 else -1
+
     state["residual_shift"] += signed_shift
     step = int(abs(state["residual_shift"]))
+    step = int(clamp(step, 0, MAX_APPEND_STEP))
     if step < int(MIN_APPEND_STEP):
+        state["last_match_step"] = int(step)
         state["prev_capture_roi"] = roi_bgr.copy()
         return 0
 
     signed_for_extract = float(np.sign(state["residual_shift"])) * float(step)
     strip, used_step = extract_feature_matched_strip(roi_bgr, state["axis"], signed_for_extract, slit_x, slit_y)
     if strip is not None and strip.size > 0:
+        state["last_match_step"] = int(used_step)
+        state["last_match_ok"] = True
+        state["last_match_src"] = "smart_phase"
         state["pano"] = paste_strip_axis(state["pano"], strip, state["axis"], state["dir"], 0)
         state["frames_used"] += 1
         state["stitched_frames"] += 1
+        state["strips_added"] += 1
         state["residual_shift"] -= float(np.sign(state["residual_shift"])) * float(used_step)
 
     state["prev_capture_roi"] = roi_bgr.copy()
@@ -1043,6 +1072,7 @@ def main():
     print("⌨ Hotkeys: A auto | SPACE manual toggle | D direction | X/Y axis | S save | R reset | G gpu | Q quit")
 
     while True:
+        state["frame_idx"] += 1
         item = grabber.get(wait=True, timeout=2.0)
         if item is None:
             key = cv2.waitKey(1) & 0xFF
@@ -1088,16 +1118,20 @@ def main():
                 if is_motion:
                     start_capture_with_preroll((w // 2) if SLIT_X < 0 else int(SLIT_X), (h // 2) if SLIT_Y < 0 else int(SLIT_Y))
                     state["postroll_left"] = 0
+                    state["capture_started_t"] = now
+                    state["stop_reason"] = ""
                     print("▶ AUTO START")
             else:
                 last_m = state["last_motion_t"]
-                if last_m is not None and (now - last_m) >= NO_MOTION_STOP_SEC:
+                cap_age = 0.0 if state["capture_started_t"] is None else (now - state["capture_started_t"])
+                if last_m is not None and (now - last_m) >= NO_MOTION_STOP_SEC and cap_age >= MIN_CAPTURE_SEC_BEFORE_STOP_CHECK:
                     if state["postroll_left"] <= 0:
                         state["postroll_left"] = int(AUTO_POSTROLL_FRAMES)
                     else:
                         state["postroll_left"] -= 1
                         if state["postroll_left"] <= 0:
                             state["capturing"] = False
+                            state["stop_reason"] = "lane_empty_timeout"
                             print("⏹ AUTO STOP -> SAVE + RESET")
                             save_panorama(tag="auto")
                             reset_panorama()
@@ -1125,6 +1159,14 @@ def main():
             state["prev_capture_roi"] = None
             state["step_ema"] = None
             state["residual_shift"] = 0.0
+
+        if SHOW_DEBUG and (state["frame_idx"] % int(max(1, DEBUG_LOG_EVERY_N_FRAMES)) == 0):
+            dx_dbg = state["last_match_dx"] if state["axis"] == "x" else state["last_match_dy"]
+            print(
+                f"DBG motion_detected={is_motion} dx={dx_dbg:.2f} smoothed_dx={state['smoothed_dx']:.2f} "
+                f"strip_width={state['last_match_step']} direction={state['dir']} frames_used={state['frames_used']} "
+                f"strips_added={state['strips_added']} stop_reason={state['stop_reason']}"
+            )
 
         if now - last_ui >= ui_period:
             last_ui = now
